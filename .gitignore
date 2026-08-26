@@ -1,0 +1,6 @@
+*.pem
+*.key
+.env
+technocore_state.json
+__pycache__/
+.venv/
