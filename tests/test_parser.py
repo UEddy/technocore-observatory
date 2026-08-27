@@ -384,6 +384,91 @@ class ParserCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("msgs scanned    8072", out.getvalue())
 
+    def test_a_bare_archive_flag_reads_the_archive_not_the_fixture(self):
+        # Reported from the first live run: the flag was ignored and the
+        # fixture path was used as the archive directory, so the command
+        # announced an empty archive that was never looked at.
+        import contextlib
+        import io
+        import os
+        import tempfile
+
+        from observatory import archive as archive_module
+
+        directory = tempfile.mkdtemp()
+        store = archive_module.Archive(os.path.join(directory, "archive"))
+        store.append(
+            archive_module.make_record(
+                url="https://technocore.chat/rooms",
+                source="http",
+                ok=True,
+                http_status=200,
+                headers={},
+                raw_body=fixture_text().encode("utf-8"),
+                elapsed_ms=1,
+                error=None,
+                backoff_seconds=None,
+                fetched_at="2026-08-27T12:00:00Z",
+            )
+        )
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = parser.main(["--archive", store.root])
+        self.assertEqual(code, 0)
+        self.assertIn("msgs scanned    8072", out.getvalue())
+        self.assertNotIn("no records", out.getvalue())
+
+    def test_a_bare_archive_flag_defaults_to_the_archive_directory(self):
+        import contextlib
+        import io
+
+        from observatory import archive as archive_module
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            parser.main(["--archive"])
+        # Whatever the state of that directory, the message names it and never
+        # the fixture.
+        printed = out.getvalue()
+        if "no records" in printed:
+            self.assertIn(archive_module.DEFAULT_ROOT, printed)
+            self.assertNotIn(FIXTURE, printed)
+
+    def test_the_positional_archive_form_still_works(self):
+        import contextlib
+        import io
+        import os
+        import tempfile
+
+        from observatory import archive as archive_module
+
+        directory = os.path.join(tempfile.mkdtemp(), "archive")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = parser.main([directory, "--archive"])
+        self.assertEqual(code, 1)
+        self.assertIn(directory, out.getvalue())
+
+    def test_two_archive_directories_at_once_is_an_error_not_a_guess(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                parser.main(["one/dir", "--archive", "another/dir"])
+        self.assertIn("give the archive directory once", err.getvalue())
+
+    def test_the_default_path_is_still_the_fixture(self):
+        import contextlib
+        import io
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = parser.main([])
+        self.assertEqual(code, 0)
+        self.assertIn("rooms read      50", out.getvalue())
+
     def test_json_output_is_machine_readable(self):
         import contextlib
         import io

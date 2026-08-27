@@ -12,6 +12,7 @@ import sys
 from datetime import datetime, timezone
 
 from . import archive, budget
+from .guard import Guard
 from .fetcher import DEFAULT_INTERVAL_SECONDS, DEFAULT_URL, MIN_INTERVAL_SECONDS, Fetcher, Outcome
 from .transport import FixtureTransport, HttpTransport
 
@@ -77,6 +78,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="report what would happen without requesting or writing")
     parser.add_argument("--status", action="store_true", help="print budget and backoff state, then exit")
     parser.add_argument("--lock", default=DEFAULT_LOCK, help=f"worker lock path (default {DEFAULT_LOCK})")
+    parser.add_argument(
+        "--guard",
+        default=None,
+        metavar="PATH",
+        help=(
+            "keep the backoff floor in this file as well as in the archive, for "
+            "runs whose archive write might not survive, such as a scheduled job "
+            "that has to push its results somewhere"
+        ),
+    )
     return parser
 
 
@@ -88,6 +99,30 @@ def parse_replay_headers(values: list[str]) -> dict[str, str]:
             raise ValueError(f"bad --replay-header value: {item!r}, expected NAME:VALUE")
         headers[name.strip().lower()] = value.strip()
     return headers
+
+
+def describe_last_attempt(store: archive.Archive) -> str:
+    """What the archive says actually happened, not what these flags would do.
+
+    Status is a diagnostic. Reporting the transport this invocation would build
+    describes a default rather than the last run, which is worse than saying
+    nothing.
+    """
+    tail = store.read_tail(limit=1)
+    if not tail:
+        return "none recorded"
+
+    record = tail[0]
+    status = record.get("http_status")
+    outcome = f"status {status}" if status is not None else "no response"
+    if not record.get("ok"):
+        outcome += f" ({record.get('error') or 'failed'})"
+    if record.get("body_lossy"):
+        outcome += ", body did not decode cleanly"
+    return (
+        f"{record.get('fetched_at') or 'unknown time'} "
+        f"from {record.get('source') or 'unknown source'}, {outcome}"
+    )
 
 
 def describe(outcome: Outcome) -> str:
@@ -130,11 +165,13 @@ def run(argv: list[str] | None = None) -> int:
         transport = FixtureTransport(args.fixture, status=args.replay_status, headers=replay_headers)
 
     store = archive.Archive(args.archive)
+    guard = Guard(args.guard)
     fetcher = Fetcher(
         transport,
         store,
         url=args.url,
         limit_per_hour=args.limit_per_hour,
+        guard=guard,
     )
 
     if args.status:
@@ -142,11 +179,14 @@ def run(argv: list[str] | None = None) -> int:
         state = fetcher.state()
         print(f"archive        {args.archive} ({len(store.files())} month file(s))")
         print(f"current file   {store.path_for()}")
-        print(f"source         {getattr(transport, 'source', transport.name)}")
+        print(f"last attempt   {describe_last_attempt(store)}")
         print(f"budget         {fetcher.budget.used(now)}/{fetcher.budget.limit} used in the last hour")
         print(f"next allowed   in {int(max(0.0, (fetcher.budget.next_allowed_at(now) - now).total_seconds()))}s")
         print(f"failures       {state.consecutive_failures} consecutive")
         print(f"backoff wait   {int(state.wait_seconds(now))}s")
+        print(f"guard          {guard.describe(now)}")
+        # Last, and labelled, so it cannot be read as a report of what ran.
+        print(f"if run now     would fetch from {getattr(transport, 'source', transport.name)}")
         return 0
 
     lock = budget.WorkerLock(args.lock)

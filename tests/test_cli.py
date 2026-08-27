@@ -100,6 +100,78 @@ class ArgumentTests(unittest.TestCase):
         self.assertEqual(len(self.store.read_tail()), 1)
 
 
+class StatusReportsWhatRanTests(ArgumentTests):
+    """Status is a diagnostic, so it reports the archive, not the flags."""
+
+    def test_status_names_the_source_that_actually_ran(self):
+        # Reported from the first live run: a status check after a live fetch
+        # printed the fixture source, because it described the transport the
+        # current flags would build rather than the last attempt.
+        self.store.append(
+            __import__("observatory.archive", fromlist=["archive"]).make_record(
+                url="https://technocore.chat/rooms",
+                source="http",
+                ok=True,
+                http_status=200,
+                headers={},
+                raw_body=b"# rooms",
+                elapsed_ms=90,
+                error=None,
+                backoff_seconds=None,
+            )
+        )
+        _, out, _ = self.run_cli("--status")
+        line = next(row for row in out.splitlines() if row.startswith("last attempt"))
+        self.assertIn("from http", line)
+        self.assertIn("status 200", line)
+        self.assertNotIn("fixture", line)
+
+    def test_the_configured_source_is_labelled_as_hypothetical(self):
+        _, out, _ = self.run_cli("--status")
+        line = next(row for row in out.splitlines() if row.startswith("if run now"))
+        self.assertIn("would fetch from", line)
+        self.assertIn("fixture", line)
+
+    def test_an_empty_archive_says_nothing_ran(self):
+        _, out, _ = self.run_cli("--status")
+        self.assertIn("last attempt   none recorded", out)
+
+    def test_a_failed_attempt_is_reported_with_its_error(self):
+        self.run_cli("--replay-status", "503")
+        _, out, _ = self.run_cli("--status")
+        line = next(row for row in out.splitlines() if row.startswith("last attempt"))
+        self.assertIn("status 503", line)
+        self.assertIn("fixture replay status 503", line)
+
+    def test_the_last_attempt_is_the_most_recent_one(self):
+        # Two attempts written directly, because a real second fetch would be
+        # gated by the backoff the first one earned.
+        from observatory import archive as archive_module
+
+        for stamp, status, ok in (
+            ("2026-08-27T12:00:00Z", 503, False),
+            ("2026-08-27T12:15:00Z", 200, True),
+        ):
+            self.store.append(
+                archive_module.make_record(
+                    url="https://technocore.chat/rooms",
+                    source="http",
+                    ok=ok,
+                    http_status=status,
+                    headers={},
+                    raw_body=b"# rooms",
+                    elapsed_ms=90,
+                    error=None if ok else f"http {status}",
+                    backoff_seconds=None if ok else 60.0,
+                    fetched_at=stamp,
+                )
+            )
+        _, out, _ = self.run_cli("--status")
+        line = next(row for row in out.splitlines() if row.startswith("last attempt"))
+        self.assertIn("2026-08-27T12:15:00Z", line)
+        self.assertIn("status 200", line)
+
+
 class ReplayHeaderParsingTests(unittest.TestCase):
     def test_names_are_lowercased_and_values_trimmed(self):
         self.assertEqual(

@@ -280,6 +280,33 @@ class DeriveStateTests(unittest.TestCase):
         self.assertEqual(state.consecutive_failures, 2)
         self.assertEqual(state.previous_delay, 120.0)
 
+    def test_records_are_ordered_by_timestamp_not_by_position(self):
+        # A union merge of two runs that both appended to the same month file
+        # can interleave their lines, so file order is not trustworthy.
+        state = derive_backoff_state(
+            [
+                {"ok": False, "backoff_seconds": 240.0, "fetched_at": "2026-08-27T11:02:00Z"},
+                {"ok": False, "backoff_seconds": 60.0, "fetched_at": "2026-08-27T11:00:00Z"},
+                {"ok": False, "backoff_seconds": 120.0, "fetched_at": "2026-08-27T11:01:00Z"},
+            ]
+        )
+        self.assertEqual(state.consecutive_failures, 3)
+        self.assertEqual(state.previous_delay, 240.0)
+        self.assertEqual(
+            state.next_attempt_at,
+            archive.parse_iso("2026-08-27T11:02:00Z") + timedelta(seconds=240),
+        )
+
+    def test_a_success_out_of_file_order_still_clears_the_ladder(self):
+        state = derive_backoff_state(
+            [
+                {"ok": True, "backoff_seconds": None, "fetched_at": "2026-08-27T11:30:00Z"},
+                {"ok": False, "backoff_seconds": 60.0, "fetched_at": "2026-08-27T11:00:00Z"},
+            ]
+        )
+        self.assertEqual(state.consecutive_failures, 0)
+        self.assertIsNone(state.next_attempt_at)
+
     def test_a_record_without_a_usable_timestamp_does_not_crash(self):
         state = derive_backoff_state(
             [{"ok": False, "backoff_seconds": 60.0, "fetched_at": "not a date"}]

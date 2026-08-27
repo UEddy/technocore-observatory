@@ -1,0 +1,14 @@
+# The archive is append only, so two runs that both appended to the same month
+# file have not really conflicted: both sets of lines are wanted. Git's built in
+# union driver keeps both sides instead of stopping a rebase for a conflict that
+# has an obvious correct resolution.
+#
+# Order after a union merge is not guaranteed, so nothing that reads the archive
+# may depend on file order alone. Readers sort by the timestamp on the record,
+# and the loader deduplicates, so a line appearing twice is harmless.
+data/archive/*.ndjson merge=union
+
+# Keep the archive and the fixture byte for byte across platforms. A rewritten
+# line ending would change every digest in the file.
+*.ndjson -text
+fixtures/* -text

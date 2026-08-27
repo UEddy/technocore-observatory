@@ -25,7 +25,7 @@ from . import store as store_module
 
 DEFAULT_OUTPUT = "site/index.html"
 
-REPO_URL = "https://github.com/technocore-observatory"
+REPO_URL = "https://github.com/UEddy/technocore-observatory"
 ENDPOINT = "https://technocore.chat/rooms"
 
 

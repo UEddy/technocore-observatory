@@ -13,3 +13,7 @@ data/observatory.db
 data/*.db
 data/*.db-journal
 data/*.building
+
+# the dashboard is generated and published as a Pages artifact, not committed
+site/
+.sampler-guard.json

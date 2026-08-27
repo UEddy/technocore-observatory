@@ -59,7 +59,7 @@ methodology a fiction.
 
 ## Status
 
-Build steps 1 to 4 of 6 are done: the fetcher with its backoff and raw NDJSON
+Build steps 1 to 4 of 6 are done, and the deployment in step 7 is in place: the fetcher with its backoff and raw NDJSON
 archive, the parser that reads it, the SQLite loader, and the metrics and static
 dashboard. Traffic classification is step 5 and is deliberately absent, from the
 code and from the page.
@@ -225,12 +225,57 @@ interprets them. A topic is a note that any caller can set on any room without
 ever posting to it.
 
 ```
-python -m observatory.parser                          # parse the saved fixture
-python -m observatory.parser --json                   # full parse as JSON
-python -m observatory.parser data/archive --archive
+python -m observatory.parser                 # parse the saved fixture
+python -m observatory.parser --json          # full parse as JSON
+python -m observatory.parser --archive       # the newest record in data/archive
+python -m observatory.parser --archive DIR   # the newest record in another archive
 ```
 
 Exit status is 0 for a clean parse and 1 for a flagged one.
+
+## Deployment
+
+`.github/workflows/sample.yml` runs the sampler on a fifteen minute cron,
+rebuilds the database, regenerates the page, commits the archive back to this
+repository and publishes the page to GitHub Pages. Nothing runs on a home
+connection and the whole data history is publicly auditable.
+
+Scheduled runs on shared runners are best effort and often land late, so the
+interval is a floor rather than a promise. The page states the snapshot count
+and the observed span instead of implying a regular cadence.
+
+A few details are load bearing:
+
+**Runs are serialised, never cancelled.** A `concurrency` group queues runs so
+there is only ever one worker, and `cancel-in-progress: false` keeps a run in
+flight alive, because it may already have made its request and killing it would
+throw away the only record that the request happened.
+
+**A failing endpoint does not fail the job.** A 429, a 503 or a timeout is an
+expected outcome that the sampler records and the dashboard reports. The step
+continues on error so that the record of the failure reaches the commit.
+
+**A lost push does not reset the backoff ladder.** Backoff position is derived
+from the archive, which is only durable once pushed. If the push fails, the
+runner is discarded and the record goes with it, and the next run would find a
+clean ladder and sample a struggling service at full cadence. So the sampler is
+also given `--guard`, a small file kept in the Actions cache rather than in the
+repository, holding when the next attempt is due. It waits for the later of the
+two. Losing the guard is safe, because the archive is authoritative again;
+losing the push is safe, because the guard still holds the line.
+
+The guard is a floor, not a full replacement: with every push failing, each run
+looks like a first failure, so the delay holds at the base sixty seconds rather
+than doubling. That is the honest limit of what a cache entry can do, and it
+still prevents the case the ladder exists for. A push that cannot be recovered
+fails the job loudly and uploads the unpushed records as an artifact, so a
+snapshot can be replayed into the archive by hand instead of being lost.
+
+**Concurrent appends resolve themselves.** Two runs that both append to the same
+month file have not really conflicted, so `.gitattributes` marks the archive
+with git's union merge driver and both sets of lines survive a rebase. Union
+merges can interleave lines, so nothing that reads the archive depends on file
+order: readers sort by the timestamp on the record, and the loader deduplicates.
 
 ## License
 

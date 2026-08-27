@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Protocol
 
 from . import archive, backoff, budget
+from .guard import Guard
 from .transport import Response
 
 DEFAULT_URL = "https://technocore.chat/rooms"
@@ -36,6 +37,17 @@ class Transport(Protocol):
     source: str
 
     def get(self, url: str) -> Response: ...
+
+
+def _record_time(record: dict[str, Any]) -> datetime:
+    """Sort key for archive records. Undateable records sort oldest."""
+    stamp = record.get("fetched_at")
+    if isinstance(stamp, str):
+        try:
+            return archive.parse_iso(stamp)
+        except ValueError:
+            pass
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 @dataclass
@@ -79,10 +91,16 @@ def derive_backoff_state(records: list[dict[str, Any]]) -> BackoffState:
     """Read the current backoff position out of the tail of the archive.
 
     Only a trailing run of failures counts: one success clears the ladder.
+
+    Records are ordered by their own timestamps rather than by their position
+    in the file. Appends are normally in order, but a union merge of two runs
+    that both wrote to the same month file can interleave them, and a hand
+    edited archive can put them in any order at all.
     """
     if not records:
         return BackoffState()
 
+    records = sorted(records, key=_record_time)
     last = records[-1]
     if last.get("ok"):
         return BackoffState()
@@ -125,12 +143,16 @@ class Fetcher:
         url: str = DEFAULT_URL,
         limit_per_hour: int = budget.HARD_CEILING_PER_HOUR,
         clock: Callable[[], datetime] | None = None,
+        guard: Guard | None = None,
     ):
         self.transport = transport
         self.store = store
         self.url = url
         self.budget = budget.Budget(store, limit_per_hour=limit_per_hour)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        # Optional floor for the case where the archive write may not survive.
+        # It can only ever delay an attempt, never bring one forward.
+        self.guard = guard
 
     def state(self) -> BackoffState:
         return derive_backoff_state(self.store.read_tail(limit=50))
@@ -147,6 +169,20 @@ class Fetcher:
                 reason=f"backing off after {state.consecutive_failures} failed attempt(s)",
                 wait_seconds=backoff_wait,
             )
+
+        if self.guard:
+            floor = self.guard.not_before(now)
+            if floor is not None:
+                guard_state = self.guard.read()
+                return Outcome(
+                    action="skipped",
+                    reason=(
+                        "guard is holding the backoff from an earlier run "
+                        f"({guard_state.consecutive_failures} failed attempt(s)) "
+                        "whose record is not in this archive"
+                    ),
+                    wait_seconds=max(0.0, (floor - now).total_seconds()),
+                )
 
         budget_wait = max(0.0, (self.budget.next_allowed_at(now) - now).total_seconds())
         if budget_wait > 0:
@@ -190,6 +226,15 @@ class Fetcher:
             fetched_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
         self.store.append(record)
+
+        if self.guard:
+            self.guard.record(
+                now=now,
+                ok=not failed,
+                delay_seconds=delay,
+                consecutive_failures=state.consecutive_failures + 1,
+                http_status=response.status,
+            )
 
         lossy = bool(record.get("body_lossy"))
         if lossy:

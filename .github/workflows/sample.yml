@@ -1,0 +1,162 @@
+name: sample
+
+# One /rooms request every fifteen minutes, the archive committed back to this
+# repository, and the dashboard published to Pages.
+#
+# Scheduled runs on shared runners are best effort and frequently land late.
+# That is accounted for: the interval is a floor, not a promise, and the page
+# states the snapshot count and the observed span rather than implying a
+# regular cadence.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+# One sequential worker, always. Runs queue rather than overlap, and a run in
+# flight is never cancelled: it may have already made its request, and killing
+# it would throw away the only record that the request happened.
+concurrency:
+  group: sampler
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the archive
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The backoff position normally comes from the archive. If a push fails
+      # the archive write is lost with the runner, so the floor is also kept
+      # here, outside the repository, where a failed push cannot reach it.
+      - name: Restore the backoff guard
+        uses: actions/cache/restore@v4
+        with:
+          path: .sampler-guard.json
+          key: sampler-guard-${{ github.run_id }}
+          restore-keys: |
+            sampler-guard-
+
+      # A 429, a 503 or a timeout is an expected outcome, not a broken job. The
+      # attempt is recorded either way and the record has to reach the commit
+      # below, so a non-zero exit here must not stop the run.
+      - name: Sample
+        id: sample
+        continue-on-error: true
+        run: |
+          python -m observatory \
+            --source http \
+            --allow-network \
+            --guard .sampler-guard.json
+
+      # Saved even when the sampler failed, because a failure is exactly what
+      # the guard is for. A fresh key each run, read back by prefix above.
+      - name: Save the backoff guard
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .sampler-guard.json
+          key: sampler-guard-${{ github.run_id }}
+
+      - name: Report the sampler outcome
+        if: always()
+        run: |
+          python -m observatory --status --guard .sampler-guard.json             --source http --allow-network
+          if [ "${{ steps.sample.outcome }}" != "success" ]; then
+            echo "::notice::The sampler did not return a clean 200. The attempt is recorded in the archive and shown on the dashboard."
+          fi
+
+      - name: Rebuild the database
+        run: python -m observatory.store
+
+      - name: Build the dashboard
+        run: python -m observatory.dashboard
+
+      # The archive is the deliverable, so a lost push is a real failure and is
+      # treated as one. Rebase and retry first, since the only likely conflict
+      # is another push landing meanwhile.
+      - name: Commit and push the archive
+        id: push
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- data/archive; then
+            echo "nothing new to commit"
+            echo "pushed=skipped" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git add data/archive
+          git commit -m "Sample $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "pushed=yes" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "push attempt $attempt failed, rebasing onto the remote"
+            if ! git pull --rebase --autostash origin "${GITHUB_REF_NAME}"; then
+              # Two runs appending to the same month file resolve themselves
+              # through the union merge driver in .gitattributes. Anything that
+              # still conflicts is not something to guess at, so abort rather
+              # than retry against a half rebased tree.
+              git rebase --abort || true
+              echo "::warning::Rebase did not resolve cleanly; leaving the archive untouched."
+              break
+            fi
+            sleep $((attempt * 5))
+          done
+
+          echo "pushed=no" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      # The push failed, so this run's records exist nowhere durable. Keep them
+      # as an artifact so the snapshot can be replayed into the archive by hand
+      # rather than being lost. The backoff floor is already safe in the cache.
+      - name: Keep the unpushed archive
+        if: failure() && steps.push.outputs.pushed == 'no'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unpushed-archive-${{ github.run_id }}
+          path: |
+            data/archive
+            .sampler-guard.json
+          retention-days: 30
+
+      # Published even when the push failed, so a stuck archive does not also
+      # freeze the page. Skipped only if the page was never built.
+      - name: Upload the dashboard
+        if: always() && hashFiles('site/index.html') != ''
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  publish:
+    needs: sample
+    # Publishes whatever the sample job managed to build, including when the
+    # push failed: the page is rebuilt from the database on every run, so it is
+    # never more stale than the archive behind it.
+    if: always()
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Deploy to Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

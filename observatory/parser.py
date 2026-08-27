@@ -465,25 +465,43 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "path",
         nargs="?",
-        default="fixtures/rooms-sample.txt",
-        help="response body to parse, or an archive directory with --archive",
+        default=None,
+        help=(
+            "response body to parse (default fixtures/rooms-sample.txt), "
+            "or an archive directory when --archive is given"
+        ),
     )
     parser.add_argument(
         "--archive",
-        action="store_true",
-        help="treat the path as an archive directory and parse its most recent record",
+        nargs="?",
+        const=archive_module.DEFAULT_ROOT,
+        default=None,
+        metavar="DIR",
+        help=(
+            "parse the most recent record in an archive directory "
+            f"(default {archive_module.DEFAULT_ROOT})"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="print the full parse as JSON")
     args = parser.parse_args(argv)
 
-    if args.archive:
-        tail = archive_module.Archive(args.path).read_tail(limit=1)
+    if args.archive is not None:
+        # Both forms are supported: a directory as the flag value, and the
+        # older form with the directory as the positional argument. Given both
+        # there is no way to tell which was meant, so say so rather than guess.
+        if args.path is not None and args.archive != archive_module.DEFAULT_ROOT:
+            parser.error(
+                f"give the archive directory once: either {args.path!r} or {args.archive!r}"
+            )
+        directory = args.path if args.path is not None else args.archive
+        tail = archive_module.Archive(directory).read_tail(limit=1)
         if not tail:
-            print(f"no records in {args.path}")
+            print(f"no records in {directory}")
             return 1
         snapshot = parse_record(tail[0])
     else:
-        with open(args.path, "r", encoding="utf-8") as handle:
+        path = args.path if args.path is not None else "fixtures/rooms-sample.txt"
+        with open(path, "r", encoding="utf-8") as handle:
             snapshot = parse(handle.read())
 
     if args.json:
