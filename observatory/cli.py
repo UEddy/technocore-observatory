@@ -11,11 +11,11 @@ import argparse
 import sys
 from datetime import datetime, timezone
 
-from . import budget
+from . import archive, budget
 from .fetcher import DEFAULT_INTERVAL_SECONDS, DEFAULT_URL, MIN_INTERVAL_SECONDS, Fetcher, Outcome
 from .transport import FixtureTransport, HttpTransport
 
-DEFAULT_ARCHIVE = "data/raw/rooms.ndjson"
+DEFAULT_ARCHIVE = archive.DEFAULT_ROOT
 DEFAULT_FIXTURE = "fixtures/rooms-sample.txt"
 DEFAULT_LOCK = "data/.sampler.lock"
 
@@ -29,7 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--url", default=DEFAULT_URL, help=f"endpoint to sample (default {DEFAULT_URL})")
-    parser.add_argument("--archive", default=DEFAULT_ARCHIVE, help=f"NDJSON archive path (default {DEFAULT_ARCHIVE})")
+    parser.add_argument(
+        "--archive",
+        default=DEFAULT_ARCHIVE,
+        help=f"archive directory, one NDJSON file per month (default {DEFAULT_ARCHIVE})",
+    )
     parser.add_argument(
         "--source",
         choices=("fixture", "http"),
@@ -95,6 +99,10 @@ def describe(outcome: Outcome) -> str:
             f"sha256={str(record.get('body_sha256'))[:12]}",
             f"ms={record.get('elapsed_ms')}",
         ]
+        if outcome.lossy:
+            # As loud as a failed parse. The snapshot is kept, but it is
+            # broken and the exit status says so.
+            parts.append(f"LOSSY BODY ({outcome.reason})")
         if outcome.wait_seconds:
             parts.append(f"backoff={int(outcome.wait_seconds)}s ({outcome.reason})")
         return " ".join(parts)
@@ -121,9 +129,10 @@ def run(argv: list[str] | None = None) -> int:
     else:
         transport = FixtureTransport(args.fixture, status=args.replay_status, headers=replay_headers)
 
+    store = archive.Archive(args.archive)
     fetcher = Fetcher(
         transport,
-        args.archive,
+        store,
         url=args.url,
         limit_per_hour=args.limit_per_hour,
     )
@@ -131,7 +140,8 @@ def run(argv: list[str] | None = None) -> int:
     if args.status:
         now = datetime.now(timezone.utc)
         state = fetcher.state()
-        print(f"archive        {args.archive}")
+        print(f"archive        {args.archive} ({len(store.files())} month file(s))")
+        print(f"current file   {store.path_for()}")
         print(f"source         {getattr(transport, 'source', transport.name)}")
         print(f"budget         {fetcher.budget.used(now)}/{fetcher.budget.limit} used in the last hour")
         print(f"next allowed   in {int(max(0.0, (fetcher.budget.next_allowed_at(now) - now).total_seconds()))}s")
@@ -146,6 +156,9 @@ def run(argv: list[str] | None = None) -> int:
         print(f"not starting: {exc}", file=sys.stderr)
         return 3
 
+    if lock.broke_stale_lock:
+        print(f"cleared a stale lock: {lock.broke_stale_lock}", file=sys.stderr)
+
     try:
         if args.loop:
             fetcher.run(
@@ -153,11 +166,12 @@ def run(argv: list[str] | None = None) -> int:
                 max_cycles=args.cycles,
                 dry_run=args.dry_run,
                 on_outcome=lambda outcome: print(describe(outcome), flush=True),
+                heartbeat=lock.heartbeat,
             )
         else:
             outcome = fetcher.attempt(dry_run=args.dry_run)
             print(describe(outcome))
-            if outcome.action == "fetched" and outcome.status != 200:
+            if outcome.action == "fetched" and not outcome.usable:
                 return 1
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)

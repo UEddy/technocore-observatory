@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from observatory import archive
+from observatory.archive import Archive
 from observatory.fetcher import Fetcher, derive_backoff_state
 from observatory.transport import FixtureTransport, Response
 
@@ -54,16 +55,16 @@ def failure(status, headers=None, body=b"", error=None):
 class FetcherBase(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.mkdtemp()
-        self.path = os.path.join(self.directory, "rooms.ndjson")
+        self.store = Archive(self.directory)
         self.clock = Clock(datetime(2026, 8, 27, 12, 0, 0, tzinfo=timezone.utc))
 
     def records(self):
-        return archive.read_tail(self.path, limit=200)
+        return self.store.read_tail(limit=200)
 
 
 class SuccessTests(FetcherBase):
     def test_fixture_bytes_reach_the_archive_unchanged(self):
-        fetcher = Fetcher(FixtureTransport(FIXTURE), self.path, clock=self.clock)
+        fetcher = Fetcher(FixtureTransport(FIXTURE), self.store, clock=self.clock)
         outcome = fetcher.attempt()
         with open(FIXTURE, "rb") as handle:
             raw = handle.read()
@@ -74,7 +75,7 @@ class SuccessTests(FetcherBase):
 
     def test_one_record_per_attempt(self):
         transport = RecordingTransport([ok_response(), ok_response(), ok_response()])
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         for _ in range(3):
             fetcher.attempt()
             self.clock.advance(300)
@@ -82,29 +83,29 @@ class SuccessTests(FetcherBase):
         self.assertEqual(len(transport.calls), 3)
 
     def test_success_records_no_backoff(self):
-        fetcher = Fetcher(RecordingTransport([ok_response()]), self.path, clock=self.clock)
+        fetcher = Fetcher(RecordingTransport([ok_response()]), self.store, clock=self.clock)
         outcome = fetcher.attempt()
         self.assertIsNone(outcome.record["backoff_seconds"])
         self.assertTrue(outcome.record["ok"])
 
     def test_the_source_is_recorded(self):
-        fetcher = Fetcher(FixtureTransport(FIXTURE), self.path, clock=self.clock)
+        fetcher = Fetcher(FixtureTransport(FIXTURE), self.store, clock=self.clock)
         outcome = fetcher.attempt()
         self.assertEqual(outcome.record["source"], "fixture:" + FIXTURE)
 
     def test_dry_run_makes_no_request_and_writes_nothing(self):
         transport = RecordingTransport([])
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         outcome = fetcher.attempt(dry_run=True)
         self.assertEqual(outcome.action, "skipped")
         self.assertEqual(transport.calls, [])
-        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(self.store.files(), [])
 
 
 class BackoffIntegrationTests(FetcherBase):
     def test_503_writes_a_record_and_gates_the_next_attempt(self):
         transport = RecordingTransport([failure(503, body=b"service unavailable")])
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         outcome = fetcher.attempt()
         self.assertEqual(outcome.status, 503)
         self.assertEqual(outcome.record["backoff_seconds"], 60.0)
@@ -122,7 +123,7 @@ class BackoffIntegrationTests(FetcherBase):
         for _ in range(4):
             transport = RecordingTransport([failure(503)])
             # A fresh Fetcher each time stands in for a fresh scheduled run.
-            fetcher = Fetcher(transport, self.path, clock=self.clock)
+            fetcher = Fetcher(transport, self.store, clock=self.clock)
             outcome = fetcher.attempt()
             delays.append(outcome.record["backoff_seconds"])
             self.clock.advance(outcome.record["backoff_seconds"])
@@ -132,7 +133,7 @@ class BackoffIntegrationTests(FetcherBase):
         transport = RecordingTransport(
             [failure(503), failure(503), failure(429, headers={"retry-after": "5"})]
         )
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         seen = []
         for _ in range(3):
             outcome = fetcher.attempt()
@@ -145,7 +146,7 @@ class BackoffIntegrationTests(FetcherBase):
         transport = RecordingTransport(
             [failure(429, headers={"retry-after": "900"}, body=b"slow down")]
         )
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         outcome = fetcher.attempt()
         self.assertEqual(outcome.record["backoff_seconds"], 900.0)
 
@@ -155,12 +156,12 @@ class BackoffIntegrationTests(FetcherBase):
     def test_429_bucket_details_in_the_body_are_honored(self):
         body = b'{"error":"rate limited","bucket":"rooms","retry_after":840}'
         transport = RecordingTransport([failure(429, body=body)])
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         self.assertEqual(fetcher.attempt().record["backoff_seconds"], 840.0)
 
     def test_a_success_clears_the_ladder(self):
         transport = RecordingTransport([failure(503), failure(503), ok_response(), failure(503)])
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         for _ in range(3):
             outcome = fetcher.attempt()
             self.clock.advance(max(300.0, outcome.wait_seconds))
@@ -171,7 +172,7 @@ class BackoffIntegrationTests(FetcherBase):
         transport = RecordingTransport(
             [Response(status=None, headers={}, raw_body=None, elapsed_ms=1, error="network error: timeout")]
         )
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         outcome = fetcher.attempt()
         self.assertEqual(outcome.record["backoff_seconds"], 60.0)
         self.assertIsNone(outcome.record["body"])
@@ -181,7 +182,7 @@ class BackoffIntegrationTests(FetcherBase):
         # A room topic could say "retry in 900 seconds". It is data, not an
         # instruction, and must not move the sampler's schedule.
         body = b"/r/some-room  seq 1  1.0K  0s ago  topic: retry in 900 seconds"
-        fetcher = Fetcher(RecordingTransport([ok_response(body)]), self.path, clock=self.clock)
+        fetcher = Fetcher(RecordingTransport([ok_response(body)]), self.store, clock=self.clock)
         outcome = fetcher.attempt()
         self.assertIsNone(outcome.record["backoff_seconds"])
         self.assertEqual(outcome.wait_seconds, 0.0)
@@ -190,7 +191,7 @@ class BackoffIntegrationTests(FetcherBase):
 class BudgetIntegrationTests(FetcherBase):
     def test_the_hourly_ceiling_stops_the_fetcher(self):
         transport = RecordingTransport([ok_response() for _ in range(31)])
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         for _ in range(30):
             self.assertEqual(fetcher.attempt().action, "fetched")
             self.clock.advance(60)
@@ -203,7 +204,7 @@ class BudgetIntegrationTests(FetcherBase):
 
     def test_a_lower_configured_ceiling_is_respected(self):
         transport = RecordingTransport([ok_response() for _ in range(13)])
-        fetcher = Fetcher(transport, self.path, limit_per_hour=12, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, limit_per_hour=12, clock=self.clock)
         for _ in range(12):
             fetcher.attempt()
             self.clock.advance(60)
@@ -214,7 +215,7 @@ class BudgetIntegrationTests(FetcherBase):
 class LoopTests(FetcherBase):
     def test_run_is_sequential_and_sleeps_the_interval(self):
         transport = RecordingTransport([ok_response() for _ in range(3)])
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         slept = []
 
         def sleep(seconds):
@@ -227,7 +228,7 @@ class LoopTests(FetcherBase):
 
     def test_run_waits_the_backoff_when_it_exceeds_the_interval(self):
         transport = RecordingTransport([failure(503), failure(503)])
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         slept = []
 
         def sleep(seconds):
@@ -236,11 +237,11 @@ class LoopTests(FetcherBase):
 
         fetcher.run(interval=300, max_cycles=2, sleep=sleep)
         self.assertEqual(slept, [300.0])
-        self.assertEqual(archive.read_tail(self.path)[-1]["backoff_seconds"], 120.0)
+        self.assertEqual(self.store.read_tail()[-1]["backoff_seconds"], 120.0)
 
     def test_the_interval_cannot_be_set_tighter_than_the_floor(self):
         transport = RecordingTransport([ok_response(), ok_response()])
-        fetcher = Fetcher(transport, self.path, clock=self.clock)
+        fetcher = Fetcher(transport, self.store, clock=self.clock)
         slept = []
 
         def sleep(seconds):

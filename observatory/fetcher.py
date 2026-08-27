@@ -18,8 +18,18 @@ from . import archive, backoff, budget
 from .transport import Response
 
 DEFAULT_URL = "https://technocore.chat/rooms"
-DEFAULT_INTERVAL_SECONDS = 300.0  # 5 minutes, per the spec
-MIN_INTERVAL_SECONDS = 120.0  # 30/hour ceiling leaves no room to go tighter
+
+# 15 minutes, not the 5 the spec first proposed. The whole 50 room window has
+# idle times spanning about a minute, so it turns over roughly once a minute:
+# every cadence the 30/hour ceiling permits, 2 minutes included, undersamples
+# the churn by an order of magnitude and can only ever report a lower bound.
+# What ships first is the exhaustion projection and the engagement series, and
+# those aggregates move slowly enough that 4 samples an hour serve them fully.
+# Meanwhile 15 minutes is a third of the load on a service that is already
+# returning 503, a third of the commits and repo growth for an archive that is
+# itself the deliverable, and a cadence a scheduled runner can actually keep.
+DEFAULT_INTERVAL_SECONDS = 900.0
+MIN_INTERVAL_SECONDS = 120.0  # the 30/hour ceiling leaves no room to go tighter
 
 
 class Transport(Protocol):
@@ -51,6 +61,18 @@ class Outcome:
     wait_seconds: float = 0.0
     status: int | None = None
     record: dict[str, Any] | None = None
+    lossy: bool = False
+
+    @property
+    def usable(self) -> bool:
+        """A 200 whose body arrived intact.
+
+        A body that did not decode cleanly is a broken snapshot, not a detail.
+        It is reported as loudly as an http failure, but it does not touch the
+        backoff ladder: the service answered, so there is nothing to back off
+        from.
+        """
+        return self.action == "fetched" and self.status == 200 and not self.lossy
 
 
 def derive_backoff_state(records: list[dict[str, Any]]) -> BackoffState:
@@ -98,20 +120,20 @@ class Fetcher:
     def __init__(
         self,
         transport: Transport,
-        archive_path: str,
+        store: archive.Archive,
         *,
         url: str = DEFAULT_URL,
         limit_per_hour: int = budget.HARD_CEILING_PER_HOUR,
         clock: Callable[[], datetime] | None = None,
     ):
         self.transport = transport
-        self.archive_path = archive_path
+        self.store = store
         self.url = url
-        self.budget = budget.Budget(archive_path, limit_per_hour=limit_per_hour)
+        self.budget = budget.Budget(store, limit_per_hour=limit_per_hour)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def state(self) -> BackoffState:
-        return derive_backoff_state(archive.read_tail(self.archive_path, limit=50))
+        return derive_backoff_state(self.store.read_tail(limit=50))
 
     def attempt(self, *, dry_run: bool = False) -> Outcome:
         """Make at most one request, and write exactly one record if it does."""
@@ -167,14 +189,21 @@ class Fetcher:
             backoff_seconds=delay,
             fetched_at=now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         )
-        archive.append(self.archive_path, record)
+        self.store.append(record)
+
+        lossy = bool(record.get("body_lossy"))
+        if lossy:
+            reason = "body did not decode cleanly as utf-8"
+        else:
+            reason = response.error or "ok"
 
         return Outcome(
             action="fetched",
-            reason=response.error or "ok",
+            reason=reason,
             wait_seconds=delay or 0.0,
             status=response.status,
             record=record,
+            lossy=lossy,
         )
 
     @staticmethod
@@ -186,7 +215,7 @@ class Fetcher:
         """
         if response.ok or response.raw_body is None:
             return None
-        text, _ = archive.decode_body(response.raw_body[:4096])
+        text, _encoding, _lossy = archive.decode_body(response.raw_body[:4096])
         return text
 
     def run(
@@ -197,6 +226,7 @@ class Fetcher:
         dry_run: bool = False,
         sleep: Callable[[float], None] = time.sleep,
         on_outcome: Callable[[Outcome], None] | None = None,
+        heartbeat: Callable[[], None] | None = None,
     ) -> list[Outcome]:
         """Sample sequentially, forever or for `max_cycles` iterations.
 
@@ -209,6 +239,10 @@ class Fetcher:
 
         while max_cycles is None or cycle < max_cycles:
             cycle += 1
+            if heartbeat:
+                # Tells the lock this worker is alive, so a long run is never
+                # mistaken for a crashed one.
+                heartbeat()
             outcome = self.attempt(dry_run=dry_run)
             outcomes.append(outcome)
             if on_outcome:
