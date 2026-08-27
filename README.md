@@ -59,8 +59,10 @@ methodology a fiction.
 
 ## Status
 
-Build steps 1 to 3 of 6 are done: the fetcher with its backoff and raw NDJSON
-archive, the parser that reads it, and the SQLite loader.
+Build steps 1 to 4 of 6 are done: the fetcher with its backoff and raw NDJSON
+archive, the parser that reads it, the SQLite loader, and the metrics and static
+dashboard. Traffic classification is step 5 and is deliberately absent, from the
+code and from the page.
 
 The parts are deliberately separate. The fetcher knows nothing about the
 response format, so a format change can never cost a snapshot; the parser never
@@ -164,6 +166,39 @@ with their raw text and counted loudly in the report; the exit status is 1 when
 there are any.
 
 Every string that came from the service is written through a bound parameter.
+
+## The dashboard
+
+```
+python -m observatory.dashboard          # writes site/index.html from the database
+```
+
+One self-contained HTML file. No framework, no build step, nothing fetched at
+page load, and no JavaScript at all, so it works with scripting disabled because
+there is nothing to disable. The charts are inline SVG generated at build time.
+
+What it shows: consumption against each published cap with a dated projection,
+the four engagement figures the server publishes about itself as time series,
+and accumulated coverage. Snapshot count, last updated, span and first snapshot
+sit at the top of the page, above the methodology and above any figure derived
+from them.
+
+Every projection prints the rate it came from, in the same block as the date,
+along with the number of samples and the span behind it. Each carries a range
+from two standard errors on the fitted rate, and says in plain words that the
+range covers scatter in the samples and not the chance that the rate changes,
+which is the part that actually decides the date. A projection resting on too
+little data says so before it says anything else. A resource that is not being
+consumed gets no date at all. When the record is shorter than the trailing
+window, the trailing rate says it is the same fit over the same samples rather
+than posing as a second opinion.
+
+Accumulated coverage is labelled a lower bound on the active set, never a
+census, with the reason given: the window turns over roughly once a minute while
+the sampler reads it once every fifteen, so a room that appears and goes quiet
+between two samples is never recorded. The turnover figure is stated the same
+way. Failed and flagged snapshots are counted on the page rather than dropped,
+because leaving them out would overstate how well the sampling went.
 
 ## Parsing
 

@@ -31,8 +31,21 @@ These are not negotiable. Violating them makes the tool part of the problem it
 measures.
 
 **Request budget.** One `/rooms` call per sampling interval is the core dataset.
-Default interval 5 minutes. Absolute ceiling of 30 requests per hour across all
+Default interval 15 minutes. Absolute ceiling of 30 requests per hour across all
 endpoints. Never run concurrent requests. One sequential worker, always.
+
+The interval was 5 minutes in the first draft of this spec. The observed data
+changed it. Every room in the 50-room window carries an idle time of under a
+minute, so the window turns over roughly once a minute, and every cadence the
+30/hour ceiling permits, including the 2 minute floor, undersamples that churn
+by an order of magnitude. Coverage of the active set is therefore a lower bound
+at any legal interval, and moving from 5 minutes to 15 loosens that bound
+without changing what kind of number it is. What the wider interval buys is
+real: a third of the request load on a service that is already returning 503, a
+third of the commits and repo growth for an archive that is itself the
+deliverable, and a cadence a shared scheduled runner can actually hold. The
+figures that ship first, resource exhaustion and the engagement series, are
+network-wide aggregates that four samples an hour serve fully.
 
 **Backoff.** On 429, honor `Retry-After` and the bucket details in the response body.
 On 503, back off exponentially starting at 60s, cap at 30 minutes. Never retry
@@ -66,7 +79,7 @@ readers draw conclusions.
 
 ### 3.1 Primary sampler
 
-`GET https://technocore.chat/rooms` every 5 minutes.
+`GET https://technocore.chat/rooms` every 15 minutes, per the interval in section 2.
 
 The response contains:
 - A header line: how many rooms shown of total, the room cap, bytes stored of total
@@ -84,10 +97,22 @@ will turn out wrong and the raw text is the only way to reprocess.
 
 ### 3.2 Coverage accumulates
 
-Because the 50-room window shifts as activity moves, repeated snapshots build broad
+Because the 50-room window shifts as activity moves, repeated snapshots build
 coverage of the active set over hours. Track first-seen and last-seen per room path.
 The churn rate of that window is itself a metric: how much of the active set turns
 over per hour.
+
+Accumulated coverage is a lower bound on the active set, never a census, and must
+be labelled that way everywhere it appears including the dashboard. The window
+turns over roughly once a minute against a sampling interval of fifteen, so the
+sampler sees at most one window in fifteen and any room that appears and goes
+quiet between two samples is never recorded at all. The same limit applies to
+churn: what the data supports is a statement that at least this many rooms were
+active and at least this much of the window turned over, and every count derived
+from accumulated coverage is a floor. Nothing here can support a claim about how
+many rooms are active in total, and no wording should imply one. The server's own
+header figure for total rooms is the only network-wide count, and it is the
+server's claim, not a measurement of ours.
 
 ### 3.3 Optional secondary sampling
 
