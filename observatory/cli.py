@@ -1,0 +1,168 @@
+"""Command line entry point for the sampler.
+
+Defaults are deliberately safe: with no arguments the tool replays the saved
+fixture and writes to the archive. Talking to the live service takes two
+explicit flags, so no development run can hit it by accident.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from datetime import datetime, timezone
+
+from . import budget
+from .fetcher import DEFAULT_INTERVAL_SECONDS, DEFAULT_URL, MIN_INTERVAL_SECONDS, Fetcher, Outcome
+from .transport import FixtureTransport, HttpTransport
+
+DEFAULT_ARCHIVE = "data/raw/rooms.ndjson"
+DEFAULT_FIXTURE = "fixtures/rooms-sample.txt"
+DEFAULT_LOCK = "data/.sampler.lock"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m observatory",
+        description=(
+            "Sample the technocore.chat rooms endpoint and archive raw responses "
+            "as NDJSON. Fetching only. Parsing is a separate step."
+        ),
+    )
+    parser.add_argument("--url", default=DEFAULT_URL, help=f"endpoint to sample (default {DEFAULT_URL})")
+    parser.add_argument("--archive", default=DEFAULT_ARCHIVE, help=f"NDJSON archive path (default {DEFAULT_ARCHIVE})")
+    parser.add_argument(
+        "--source",
+        choices=("fixture", "http"),
+        default="fixture",
+        help="where responses come from (default fixture, which makes no network calls)",
+    )
+    parser.add_argument("--fixture", default=DEFAULT_FIXTURE, help=f"fixture file for --source fixture (default {DEFAULT_FIXTURE})")
+    parser.add_argument(
+        "--allow-network",
+        action="store_true",
+        help="required alongside --source http, so live requests are always deliberate",
+    )
+    parser.add_argument(
+        "--replay-status",
+        type=int,
+        default=200,
+        help="status the fixture transport should report, for exercising backoff offline",
+    )
+    parser.add_argument(
+        "--replay-header",
+        action="append",
+        default=[],
+        metavar="NAME:VALUE",
+        help="header the fixture transport should report, repeatable",
+    )
+    parser.add_argument(
+        "--interval",
+        type=float,
+        default=DEFAULT_INTERVAL_SECONDS,
+        help=f"seconds between samples (default {int(DEFAULT_INTERVAL_SECONDS)}, floor {int(MIN_INTERVAL_SECONDS)})",
+    )
+    parser.add_argument("--once", action="store_true", help="make a single attempt and exit (the default)")
+    parser.add_argument("--loop", action="store_true", help="keep sampling on the interval until interrupted")
+    parser.add_argument("--cycles", type=int, default=None, help="stop after this many cycles in loop mode")
+    parser.add_argument(
+        "--limit-per-hour",
+        type=int,
+        default=budget.HARD_CEILING_PER_HOUR,
+        help=f"request ceiling per hour (default and hard maximum {budget.HARD_CEILING_PER_HOUR})",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="report what would happen without requesting or writing")
+    parser.add_argument("--status", action="store_true", help="print budget and backoff state, then exit")
+    parser.add_argument("--lock", default=DEFAULT_LOCK, help=f"worker lock path (default {DEFAULT_LOCK})")
+    return parser
+
+
+def parse_replay_headers(values: list[str]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for item in values:
+        name, separator, value = item.partition(":")
+        if not separator:
+            raise ValueError(f"bad --replay-header value: {item!r}, expected NAME:VALUE")
+        headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def describe(outcome: Outcome) -> str:
+    if outcome.action == "fetched":
+        record = outcome.record or {}
+        parts = [
+            f"fetched status={outcome.status}",
+            f"bytes={record.get('body_bytes')}",
+            f"sha256={str(record.get('body_sha256'))[:12]}",
+            f"ms={record.get('elapsed_ms')}",
+        ]
+        if outcome.wait_seconds:
+            parts.append(f"backoff={int(outcome.wait_seconds)}s ({outcome.reason})")
+        return " ".join(parts)
+    return f"skipped: {outcome.reason} (retry in {int(outcome.wait_seconds)}s)"
+
+
+def run(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.source == "http" and not args.allow_network:
+        parser.error("--source http requires --allow-network. Development runs use --source fixture.")
+    if args.limit_per_hour > budget.HARD_CEILING_PER_HOUR:
+        parser.error(f"--limit-per-hour cannot exceed the hard ceiling of {budget.HARD_CEILING_PER_HOUR}")
+
+    try:
+        replay_headers = parse_replay_headers(args.replay_header)
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2
+
+    if args.source == "http":
+        transport = HttpTransport()
+    else:
+        transport = FixtureTransport(args.fixture, status=args.replay_status, headers=replay_headers)
+
+    fetcher = Fetcher(
+        transport,
+        args.archive,
+        url=args.url,
+        limit_per_hour=args.limit_per_hour,
+    )
+
+    if args.status:
+        now = datetime.now(timezone.utc)
+        state = fetcher.state()
+        print(f"archive        {args.archive}")
+        print(f"source         {getattr(transport, 'source', transport.name)}")
+        print(f"budget         {fetcher.budget.used(now)}/{fetcher.budget.limit} used in the last hour")
+        print(f"next allowed   in {int(max(0.0, (fetcher.budget.next_allowed_at(now) - now).total_seconds()))}s")
+        print(f"failures       {state.consecutive_failures} consecutive")
+        print(f"backoff wait   {int(state.wait_seconds(now))}s")
+        return 0
+
+    lock = budget.WorkerLock(args.lock)
+    try:
+        lock.acquire()
+    except budget.LockHeld as exc:
+        print(f"not starting: {exc}", file=sys.stderr)
+        return 3
+
+    try:
+        if args.loop:
+            fetcher.run(
+                interval=args.interval,
+                max_cycles=args.cycles,
+                dry_run=args.dry_run,
+                on_outcome=lambda outcome: print(describe(outcome), flush=True),
+            )
+        else:
+            outcome = fetcher.attempt(dry_run=args.dry_run)
+            print(describe(outcome))
+            if outcome.action == "fetched" and outcome.status != 200:
+                return 1
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 130
+    finally:
+        lock.release()
+
+    return 0

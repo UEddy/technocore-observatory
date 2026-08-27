@@ -4,3 +4,6 @@
 technocore_state.json
 __pycache__/
 .venv/
+
+# sampler runtime
+data/.sampler.lock
